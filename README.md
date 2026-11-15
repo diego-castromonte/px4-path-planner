@@ -81,11 +81,6 @@ make px4_sitl gz_x500
 ```
 
 Activate the Python environment and run the flight script:
-
-# Clone the repository once
-git clone https://github.com/diego-castromonte/px4-path-planner.git
-cd px4-path-planner/PathFinding
-
 # Activate the MAVSDK environment
 source ~/px4-python/bin/activate
 
