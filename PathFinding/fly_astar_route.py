@@ -1,0 +1,363 @@
+import asyncio
+import math
+import numpy as np
+import time
+
+from mavsdk import System
+from mavsdk.offboard import OffboardError, PositionNedYaw
+
+# Settings  
+ALTITUDE_M = 3.0
+DT = 0.1  # 10 Hz 
+CRUISE_SPEED = 3.0 # m/s on straight sections
+TURN_SPEED = 1.0  # m/s at sharp turns
+START_SPEED = 0.5  # m/s
+MAX_ACCEL = 2.0  # m/s^2
+PATH_SAMPLE_SPACING = 0.10 # meters; internal path resolution
+TURN_THRESHOLD_DEG = 45.0 # ignore tiny bends 
+
+WAYPOINTS = [(-21, -20), (-19.2, -20.0), (-18.77, -19.95), (-18.43, -19.81), (-18.19, -19.57), (-18.05, -19.23), (-18.0, -18.8), (-18.0, -18.2), (-17.95, -17.77), (-17.81, -17.43), (-17.57, -17.19), (-17.23, -17.05), (-16.8, -17.0), (-9.0, -17.0), (-8.28, -16.92), (-7.72, -16.68), (-7.32, -16.28), (-7.08, -15.72), (-7.0, -15.0), (-7, -11), (-8, -11), (-8,-9), (-9, -9), (-9, -7), (-10, -7), (-10, -6), (-11, -6), (-11, -5), (-12, -5), (-12, -3), (-13, -3), (-13, -2), (-15, -2), (-15, -1), (-16, -1), (-16, 0), (-17, 0), (-17, 1), (-18, 1), (-18, 16), (-8, 16), (-8, 17), (-6, 17), (-6, 18), (-5, 18), (-5, 19), (16, 19), (16, 20), (17, 20), (17, -2), (18, -2), (18, -4), (19, -4), (19, -6), (20, -6), (20, -8), (21, -8), (21, -20)]
+
+def calculate_yaw(current_north, current_east, target_north, target_east):
+    """
+    Calculates the heading angle (yaw) from current position to target position.
+    Returns yaw in degrees (0 to 360, where 0 is North, 90 is East).
+    """
+    delta_north = target_north - current_north
+    delta_east = target_east - current_east
+
+    # atan2(y, x) in NE coordinates 
+    yaw_rad = math.atan2(delta_east, delta_north)
+
+    # convert to degrees 
+    yaw_deg = math.degrees(yaw_rad)
+
+    # normalize to 0 to 360 
+    if yaw_deg < 0:
+        yaw_deg += 360
+
+    return yaw_deg
+
+async def wait_until_reached(drone, target_north, target_east, target_down):
+    REACHED_DISTANCE_M = 0.15
+    REACHED_ALTITUDE_M = 0.3
+    LOG_INTERVAL_S = 1.0
+
+    start_time = time.monotonic()
+    last_log_time = 0.0
+    
+    async for position_velocity in drone.telemetry.position_velocity_ned():
+        current_north = position_velocity.position.north_m
+        current_east = position_velocity.position.east_m
+        current_down = position_velocity.position.down_m
+
+        horizontal_error = math.sqrt(
+            (target_north - current_north) ** 2
+            + (target_east - current_east) ** 2
+        )
+        altitude_error = abs(target_down - current_down)
+
+        elapsed = time.monotonic() - start_time
+
+        if elapsed - last_log_time >= LOG_INTERVAL_S:
+            print(
+                f"Time: {elapsed:.1f} s | "
+                f"Horizontal error: {horizontal_error:.2f} m | "
+                f"Altitude error: {altitude_error:.2f} m"
+            )
+            last_log_time = elapsed
+
+        if (
+            horizontal_error < REACHED_DISTANCE_M
+            and altitude_error < REACHED_ALTITUDE_M
+        ):
+            print(f"Waypoint reached in {elapsed:.1f} seconds.")
+            return
+# curves into smooth path!!! 
+def distance(a, b):
+    return float(np.linalg.norm(a - b))
+
+def point_at_distance(route, cumulative_distances, s):
+    """
+    Returns the North/East coordinate located s meters along the route.
+    example, if the route goes from (0, 0) to (10, 0) to (10, 10),
+    then s=13 returns (10,3) 
+    Treats consecutive N/E waypoints as connected line segments.
+    """
+    if s <= 0:
+        return route[0]
+
+    if s >= cumulative_distances[-1]:
+        return route[-1]
+
+    segment_index = np.searchsorted(cumulative_distances, s, side="right") - 1
+    segment_index = min(segment_index, len(route) - 2)
+
+    start_distance = cumulative_distances[segment_index]
+    end_distance = cumulative_distances[segment_index + 1]
+
+    fraction = (s - start_distance) / (end_distance - start_distance)
+
+    return route[segment_index] + fraction * (route[segment_index + 1] - route[segment_index]
+    )
+
+def turn_angle_degrees(a, b, c):
+    """
+    Returns the direction-change angle at p1, using the path
+    segments p0 -> p1 and p1 -> p2.
+    0 degrees = straight, 90 = turn 
+    """
+    incoming = b - a 
+    outgoing = c - b
+
+    incoming_length = np.linalg.norm(incoming)
+    outgoing_length = np.linalg.norm(outgoing)
+
+    if incoming_length == 0 or outgoing_length == 0:
+        return 0.0 
+
+    cosine_angle = np.dot(incoming, outgoing) / (incoming_length * outgoing_length)
+    cosine_angle = np.clip(cosine_angle, -1.0, 1.0)
+    return math.degrees(math.acos(cosine_angle))
+
+def make_speed_profile(route):
+    """
+    Slows the drone before sharp turns & final waypoint,
+    Accelerate back toward CRUISE speed on straight sections
+    """
+    route = np.asarray(route, dtype=float)
+    # find total distance at each original point 
+    segment_lengths = [
+        distance(route[i], route[i + 1])
+        for i in range(len(route)-1)
+    ]
+
+    cumulative_distances = [0.0]
+    for segment_length in segment_lengths: 
+        cumulative_distances.append(cumulative_distances[-1] + segment_length)
+
+    total_distance = cumulative_distances[-1]
+
+    # even spacing between points 
+    sample_distances = np.arange(
+        0.0,
+        total_distance,
+        PATH_SAMPLE_SPACING
+    )
+
+    if sample_distances[-1] != total_distance:
+        sample_distances = np.append(sample_distances, total_distance)
+
+    # having cruise speed as the normal speed
+    speed_limits = np.ones(len(sample_distances)) * CRUISE_SPEED
+
+    # Starting and Final speed
+    speed_limits[0] = START_SPEED
+    speed_limits[-1] = 0.0 
+
+    """ 
+    Smart curve method, determinind if curve or not
+    """
+    for i in range(1, len(route) -1):
+        angle = turn_angle_degrees(
+            route[i-1],
+            route[i],
+            route[i+1]
+        )
+        if angle > TURN_THRESHOLD_DEG:
+            corner_distance = cumulative_distances[i]
+            sample_index = np.argmin(
+                np.abs(sample_distances - corner_distance)
+            )
+            speed_limits[sample_index] = TURN_SPEED
+
+            print(
+                f"Turn: N={route[i][0]:.1f}, E={route[i][1]:.1f} | "
+                f"Angle={angle:.1f}° | "
+                f"Speed limit={TURN_SPEED:.1f} m/s"
+            )
+
+    """ 
+    Backward pass: limit speed when turning 
+    """
+    speed_profile = speed_limits.copy()
+    for i in range(len(speed_profile) -2, -1, -1):
+        ds = sample_distances[i+1] - sample_distances[i]
+
+        max_safe_speed = math.sqrt(
+            speed_profile[i+1] ** 2 + 2 * MAX_ACCEL * ds
+        )
+        speed_profile[i] = min(
+            speed_profile[i],
+            max_safe_speed
+        )
+
+    """ 
+    Foward pass: accelerate when see straight path, not > MAX_ACCEL 
+    """
+    for i in range(1, len(speed_profile)):
+        ds = sample_distances[i] - sample_distances[i -1]
+
+        max_reachable_speed = math.sqrt(
+            speed_profile[i - 1] ** 2 + 2 * MAX_ACCEL * ds
+        )
+
+        speed_profile[i] = min(
+            speed_profile[i],
+            max_reachable_speed
+        )
+    return cumulative_distances, sample_distances, speed_profile
+
+async def main():
+    drone = System()
+    await drone.connect(system_address="udpin://0.0.0.0:14540")
+
+    print("Waiting for PX4 connection...")
+    async for state in drone.core.connection_state():
+        if state.is_connected:
+            print("PX4 connected.")
+            break
+
+    print("Arming...")
+    await drone.action.arm()
+
+    await drone.offboard.set_position_ned(
+        PositionNedYaw(0.0, 0.0, 0.0, 0.0)
+    )
+
+    print("Starting Offboard mode...")
+    try:
+        await drone.offboard.start()
+    except OffboardError as error:
+        print(f"Offboard start failed: {error._result.result}")
+        await drone.action.disarm()
+        return
+
+    print(f"Taking off to {ALTITUDE_M} m...")
+    await drone.offboard.set_position_ned(
+        PositionNedYaw(0.0, 0.0, -ALTITUDE_M, 0.0)
+    )
+    await wait_until_reached(drone, 0.0, 0.0, -ALTITUDE_M)
+
+    # Shift the planned path so its first point is the PX4 local origin.
+    route = np.asarray(WAYPOINTS, dtype=float)
+    route = route - route[0]
+
+    cumulative_distances, sample_distances, speed_profile = (
+        make_speed_profile(route)
+    )
+
+    route_length = cumulative_distances[-1]
+    progress_m = 0.0
+    virtual_speed = START_SPEED
+
+    route_start_time = time.monotonic()
+    last_log_time = -1.0
+
+    print("\n--- STREAMING SMOOTH ROUTE AT 10 Hz ---")
+    print(f"Route length: {route_length:.2f} m")
+
+    next_tick = time.monotonic()
+    last_yaw = 0.0 
+    while progress_m < route_length:
+        elapsed = time.monotonic() - route_start_time
+
+        # Speed desired at the current distance along the route.
+        target_speed = float(np.interp(
+            progress_m,
+            sample_distances,
+            speed_profile
+        ))
+
+        # Gradually accelerate or brake.
+        if virtual_speed < target_speed:
+            virtual_speed = min(
+                virtual_speed + MAX_ACCEL * DT,
+                target_speed
+            )
+        else:
+            virtual_speed = max(
+                virtual_speed - MAX_ACCEL * DT,
+                target_speed
+            )
+
+        # Move forward by v × dt meters.
+        progress_m = min(
+            progress_m + virtual_speed * DT,
+            route_length
+        )
+
+        # Convert route-distance back into the current N/E target.
+        north_m, east_m = point_at_distance(
+            route,
+            cumulative_distances,
+            progress_m
+        )
+        lookahead_m = max(0.25, virtual_speed * 0.5)
+        ahead_north, ahead_east = point_at_distance(
+            route,
+            cumulative_distances,
+            min(progress_m + lookahead_m, route_length)
+        )
+        if math.hypot(ahead_north - north_m, ahead_east - east_m) > 1e-6:
+            last_yaw = calculate_yaw(
+                north_m,
+                east_m,
+                ahead_north,
+                ahead_east
+            )
+
+        await drone.offboard.set_position_ned(
+            PositionNedYaw(
+                float(north_m),
+                float(east_m),
+                -ALTITUDE_M,
+                last_yaw
+            )
+        )
+
+        if elapsed - last_log_time >= 1.0:
+            print(
+                f"Time {elapsed:5.1f}s | "
+                f"N={north_m:6.2f}, E={east_m:6.2f} | "
+                f"Speed={virtual_speed:.2f} m/s"
+            )
+            last_log_time = elapsed
+
+        next_tick += DT
+        await asyncio.sleep(max(0.0, next_tick - time.monotonic()))
+
+    # Only wait at the actual final destination.
+    final_north, final_east = route[-1]
+
+    await drone.offboard.set_position_ned(
+        PositionNedYaw(
+            float(final_north),
+            float(final_east),
+            -ALTITUDE_M,
+            last_yaw
+        )
+    )
+
+    await wait_until_reached(
+        drone,
+        float(final_north),
+        float(final_east),
+        -ALTITUDE_M
+    )
+
+    route_time = time.monotonic() - route_start_time
+    print(f"\nRoute complete in {route_time:.1f} seconds.")
+    
+    print("Route complete. Stopping Offboard mode...")
+    await drone.offboard.stop()
+
+    print("Landing...")
+    await drone.action.land()
+    await asyncio.sleep(4)
+
+    print("Flight complete.")
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
