@@ -94,8 +94,6 @@ python fly_astar_route.py
 - Minimum-snap trajectory generation with time allocation
 - Position, velocity, acceleration, yaw, and yaw-rate feed-forward references
 - Fixed-seed random maps and randomized waypoint testing
-- Quantitative comparison of raw A*, simplified A*, and minimum-snap trajectories
-- Metrics including travel time, path length, clearance, tracking error, velocity error, acceleration, jerk, and yaw error
 
 ## Notes
 
