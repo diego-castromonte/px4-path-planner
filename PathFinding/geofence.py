@@ -1,6 +1,8 @@
 import pygame
 import json 
 import math 
+from pathlib import Path
+import numpy as np
 from queue import PriorityQueue
 
 ROWS = 55
@@ -17,6 +19,15 @@ TURN_RADIUS_CELLS = 2.0   # How far before/after a corner the curve starts/ends
 MIN_RADIUS_CELLS = 0.6    # Below this, keep the corner sharp
 CURVE_POINTS = 4          # Points generated inside each quadratic curve
 
+# Epsilon (RDP)
+RDP_EPSILON = 0.63
+
+# Minimum-snap trajectory settings.  Coordinates remain in grid-cell units until
+# after collision validation, so the trajectory is checked against the same map
+# that A* used.
+MIN_SNAP_SPEED_CELLS_PER_SEC = 1.0
+MIN_SNAP_SAMPLE_SPACING_CELLS = 0.10
+
 #COLORS 
 RED = (255,0,0) # A* search
 GREEN = (0,255,0) # A* search available 
@@ -30,7 +41,7 @@ GREY = (128, 128, 128)
 TURQUOISE = (55, 255, 245) # Way point 1
 CYAN = (0, 240, 229) # Way point 2 
 TOURMALINE = (0, 180, 171) # Waypoint 3 
-MAP_FILE = "geofence_map.json"
+MAP_FILE = Path(__file__).resolve().with_name("geofence_map.json")
 WAYPOINT_COLORS = [TURQUOISE, CYAN, TOURMALINE]
 # PYGAME WINDOW 
 pygame.init()
@@ -71,7 +82,7 @@ class Spot:
         self.color = GREEN
     def make_barrier(self):
         self.color = BLACK 
-
+    
     def make_path(self):
         self.color = PURPLE
 
@@ -94,26 +105,40 @@ class Spot:
         return False
     def update_neighbors(self, grid):
         self.neighbors = []
-        #DOWN
-        if self.row < self.total_rows - 1:
-            candidate = grid[self.row + 1][self.col]
-            if not candidate.is_barrier() and not candidate.is_too_close_to_barrier(grid):
-                self.neighbors.append(candidate)
-        #UP
-        if self.row > 0:
-            candidate = grid[self.row -1][self.col]
-            if not candidate.is_barrier() and not candidate.is_too_close_to_barrier(grid):
-                self.neighbors.append(candidate)
-        #RIGHT 
-        if self.col < self.total_rows - 1: 
-            candidate = grid[self.row][self.col + 1]
-            if not candidate.is_barrier() and not candidate.is_too_close_to_barrier(grid):
-                self.neighbors.append(candidate)
-        #LEFT
-        if self.col > 0:
-            candidate = grid[self.row][self.col - 1]
-            if not candidate.is_barrier() and not candidate.is_too_close_to_barrier(grid):
-                self.neighbors.append(candidate)
+
+        # Straight Directions 
+        straight_dirs = [(1, 0), (-1, 0), (0, 1), (0, -1)]
+        for dr, dc in straight_dirs:
+            row, col = self.row + dr, self.col + dc 
+            if 0 <= row < self.total_rows and 0 <= col < self.total_rows:
+                candiate = grid[row][col]
+                if not candiate.is_barrier() and not candiate.is_too_close_to_barrier(
+                    grid
+                ):
+                    self.neighbors.append((candiate, 1))
+
+        # Diagonal Directions
+        diagonal_dirs = [(1, 1), (1, -1), (-1, 1), (-1, -1)]
+        for dr, dc in diagonal_dirs:
+            row, col = self.row + dr, self.col + dc
+
+            if 0 <= row < self.total_rows and 0 <= col < self.total_rows:
+                candidate = grid[row][col]
+
+                side_row = grid[self.row + dr][self.col]
+                side_col = grid[self.row][self.col + dc]
+
+                if (
+                    candidate.is_barrier()
+                    or candidate.is_too_close_to_barrier(grid)
+                    or side_row.is_barrier()
+                    or side_row.is_too_close_to_barrier(grid)
+                    or side_col.is_barrier()
+                    or side_col.is_too_close_to_barrier(grid)
+                ):
+                    continue 
+                self.neighbors.append((candidate, math.sqrt(2)))
+
     def __lt__(self, other):
         return False
 
@@ -188,6 +213,323 @@ def simplify_path(path):
     simplified.append(path[-1])
     return simplified 
 
+""" ====== RDP and Minimum Snap ===== """
+def prep_distance(point, line_start, line_end):
+    """ Finds the shortest distance of the line segment"""
+    px, py = point 
+    x1, y1 = line_start 
+    x2, y2 = line_end 
+
+    dx = x2 - x1
+    dy = y2 - y1 
+
+# If the segment has zero length, return the distance to its single point.
+    if dx == 0 and dy == 0:
+        return math.hypot(px-x1, py-y1)
+    # Project the point onto the segment; clamp t so it stays from start (0) to end (1).
+    t = ((px - x1)* dx + (py-y1)* dy) / (dx * dx + dy * dy)
+    t = max(0.0, min(1.0, t))
+
+    closest_x = x1 + t * dx 
+    closest_y = y1 + t * dy 
+    return math.hypot(px - closest_x, py - closest_y)
+
+def rdp(points, epsilon):
+    """simplfy the waypoints points using RDP"""
+    if len(points) < 3:
+        return points 
+    # Find the point with the maximum distance 
+    max_dist = 0.0 
+    index = 0 
+    for i in range(1, len(points) -1):
+        dist = prep_distance(points[i], points[0], points[-1])
+        if dist > max_dist:
+            max_dist = dist 
+            index = i 
+    # If distance > epsilon, keep the points and half split 
+    if max_dist > epsilon:
+        left_half = rdp(points[:index + 1], epsilon)
+        right_half = rdp(points[index:], epsilon)
+        # combine both half without any duplicants 
+        return left_half[:-1] + right_half
+    # Otherwise, delete all middle points 
+    return [points[0], points[-1]]
+
+def polynomial_basis(time_s, derivative=0):
+    """Return the 7th-degree polynomial basis for one derivative order.
+    p(0)    = c0
+    p'(0)   = c1
+    p''(0)  = 2c2
+    p'''(0) = 6c3
+    """
+    basis = np.zeros(8)
+    for power in range(derivative, 8):
+        coefficient = math.factorial(power) / math.factorial(power - derivative)
+        basis[power] = coefficient * time_s ** (power - derivative)
+    return basis
+
+def minimum_snap_hessian(durations):
+    """Build the integrated-squared-snap cost for 7th-degree segments."""
+    segment_count = len(durations)
+    hessian = np.zeros((8 * segment_count, 8 * segment_count))
+
+    for segment, duration in enumerate(durations):
+        offset = 8 * segment
+        for row in range(4, 8):
+            for col in range(4, 8):
+                row_factor = math.factorial(row) / math.factorial(row - 4)
+                col_factor = math.factorial(col) / math.factorial(col - 4)
+                exponent = row + col - 7
+                hessian[offset + row, offset + col] = (
+                    row_factor * col_factor * duration ** exponent / exponent
+                )
+    return hessian
+
+def minimum_snap_constraints(waypoint_values, durations):
+    """Constrain waypoint positions
+    polynomial_basis(0.0, 0)  # position at t = 0 -> Start position= first waypoint
+    polynomial_basis(0.0, 1)  # velocity at t = 0 -> start velo=0
+    polynomial_basis(0.0, 2)  # acceleration at t = 0 -> start accel =0
+    polynomial_basis(0.0, 3)  # jerk at t = 0 -> start jerk =0
+    """
+    segment_count = len(durations)
+    variable_count = 8 * segment_count
+    rows = []
+    values = []
+
+    # Start and finish at rest through jerk, plus their fixed positions.
+    for derivative in range(4): # t = 0 
+        row = np.zeros(variable_count)
+        row[:8] = polynomial_basis(0.0, derivative) #8 coeff of first segment
+        rows.append(row)
+        values.append(waypoint_values[0] if derivative == 0 else 0.0)
+
+        row = np.zeros(variable_count) # t = T
+        row[-8:] = polynomial_basis(durations[-1], derivative) #8 coeff of final segment
+        rows.append(row)
+        values.append(waypoint_values[-1] if derivative == 0 else 0.0)
+
+# Pin each interior position and make position, velocity, acceleration,
+# and jerk continuous across its two neighbouring segments.
+    for segment in range(segment_count - 1):
+        current = slice(8 * segment, 8 * (segment + 1))
+        following = slice(8 * (segment + 1), 8 * (segment + 2))
+
+    # Current segment must end at this anchor position.
+        row = np.zeros(variable_count)
+        row[current] = polynomial_basis(durations[segment], 0)
+        rows.append(row)
+        values.append(waypoint_values[segment + 1])
+
+    # Next segment must start at the same anchor position.
+        row = np.zeros(variable_count)
+        row[current] = polynomial_basis(durations[segment], 0)
+        row[following] = -polynomial_basis(0.0, 0)
+        rows.append(row)
+        values.append(0.0)
+
+    # Both segment stop at this anchor point 
+    # Both segment ends/begin with velocity/acceleration/jerk = 0.
+        for derivative in range(1, 4): # (0 position,1 velocity,2 accel,3 jerk)  
+            row = np.zeros(variable_count)
+            row[current] = polynomial_basis(durations[segment], derivative)
+            rows.append(row)
+            values.append(0.0)
+
+            row = np.zeros(variable_count)
+            row[following] = polynomial_basis(0.0, derivative)
+            rows.append(row)
+            values.append(0.0)
+
+    return np.asarray(rows), np.asarray(values)
+
+def solve_minimum_snap(route_grid, speed=MIN_SNAP_SPEED_CELLS_PER_SEC):
+    """Solve a local, unconstrained 7th-degree minimum-snap trajectory.
+
+    ``route_grid`` is a sequence of (row, col) coordinates.  This deliberately
+    has no dependency on snap.py or minimum_snap.py.
+    """
+    waypoints = np.asarray(route_grid, dtype=float)
+    if len(waypoints) < 2:
+        return waypoints, np.empty(0)
+
+    distances = np.linalg.norm(np.diff(waypoints, axis=0), axis=1)
+    durations = np.maximum(distances / speed, 0.1)
+    hessian = minimum_snap_hessian(durations)
+    constraint_matrix, _ = minimum_snap_constraints(waypoints[:, 0], durations)
+    variable_count = hessian.shape[0]
+
+    # KKT solve: min 1/2 c'Qc subject to Ac=b.  A tiny diagonal term only
+    # resolves the null space of the snap objective; equality constraints still
+    # determine the physical trajectory.
+    kkt = np.block([
+        [hessian + np.eye(variable_count) * 1e-9, constraint_matrix.T],
+        [constraint_matrix, np.zeros((len(constraint_matrix), len(constraint_matrix)))],
+    ])
+    coefficients = []
+    for dimension in range(2):
+        _, constraint_values = minimum_snap_constraints(
+            waypoints[:, dimension], durations
+        )
+        rhs = np.concatenate((np.zeros(variable_count), constraint_values))
+        try:
+            solution = np.linalg.solve(kkt, rhs)
+        except np.linalg.LinAlgError as error:
+            raise RuntimeError("Minimum-snap KKT system is singular") from error
+        coefficients.append(solution[:variable_count].reshape(-1, 8))
+
+    return np.stack(coefficients, axis=-1), durations
+
+def sample_minimum_snap(coefficients, durations):
+    """Sample each polynomial densely enough for grid collision validation."""
+    samples = []
+    for segment, duration in enumerate(durations):
+        distance_scale = max(duration * MIN_SNAP_SPEED_CELLS_PER_SEC, 1.0)
+        count = max(2, math.ceil(distance_scale / MIN_SNAP_SAMPLE_SPACING_CELLS))
+        for time_s in np.linspace(0.0, duration, count, endpoint=False):
+            samples.append(tuple(polynomial_basis(time_s) @ coefficients[segment]))
+
+    samples.append(tuple(polynomial_basis(durations[-1]) @ coefficients[-1]))
+    return samples
+
+def get_grid_line_cells(start_point, end_point):
+    row, col = start_point 
+    end_row, end_col = end_point
+
+    row_distance = abs(end_row - row)
+    col_distance = abs(end_col - col)
+
+    row_step = 1 if row < end_row else -1
+    col_step = 1 if col < end_col else -1 
+    error = col_distance - row_distance
+    cells = []
+
+    while True: 
+        cells.append((row, col))
+        if row == end_row and col == end_col:
+            return cells 
+        twice_error = 2 * error 
+        if twice_error > -row_distance:
+            error -= row_distance
+            col += col_step
+        if twice_error < col_distance:
+            error += col_distance
+            row += row_step
+
+def is_safe_grid_point(point, grid):
+    """Check a floating-point grid coordinate against obstacles and geofence."""
+    row, col = point
+    check_row = round(row)
+    check_col = round(col)
+    if not (0 <= check_row < len(grid) and 0 <= check_col < len(grid)):
+        return False
+
+    spot = grid[check_row][check_col]
+    return is_inside_geofence(spot) and not spot.is_too_close_to_barrier(grid)
+
+def is_safe_continuous_segment(start_point, end_point, grid):
+    for cell in get_supercover_line_cells(start_point, end_point):
+        if not is_safe_grid_point(cell, grid):
+            return False
+
+    return True
+
+def is_safe_minimum_snap_path(samples, grid):
+    """Validate all samples and the grid cells crossed between samples."""
+    for previous, current in zip(samples, samples[1:]):
+        if not is_safe_grid_point(previous, grid):
+            return False, previous
+
+        if not is_safe_continuous_segment(previous, current, grid):
+            return False, current
+
+    if samples and not is_safe_grid_point(samples[-1], grid):
+        return False, samples[-1]
+    return True, None
+
+def get_supercover_line_cells(start_point, end_point):
+    """Return every grid cell touched by a continuous line segment."""
+    
+    start_row, start_col = start_point 
+    end_row, end_col = end_point 
+
+    row_delta = end_row - start_row
+    col_delta = end_col - start_col 
+# Determine which direction the line moves through rows and columns.
+# row_step = up/down/no row movement
+    if row_delta > 0:
+        row_step = 1
+    elif row_delta < 0:
+        row_step = -1
+    else: 
+        row_step = 0
+# col_step = left/right/no column movement
+    if col_delta > 0:
+        col_step = 1
+    elif col_delta < 0:
+        col_step = -1
+    else:
+        col_step = 0
+
+    current_row = math.floor(start_row + 0.5)
+    current_col = math.floor(start_col + 0.5)
+
+    end_cell_row = math.floor(end_row + 0.5)
+    end_cell_col = math.floor(end_col + 0.5)
+    cells = [(current_row, current_col)]
+
+    if row_step != 0:
+        next_row_boundary = current_row + 0.5 * row_step
+        t_max_row = (
+            (next_row_boundary - start_row) / row_delta
+        )
+        t_delta_row = 1.0 / abs(row_delta) 
+    else: 
+        t_max_row = math.inf 
+        t_delta_row = math.inf 
+
+    if col_step != 0:
+        next_col_boundary = current_col + 0.5 * col_step 
+        t_max_col = (
+            (next_col_boundary - start_col) / col_delta
+        )
+        t_delta_col = 1.0 / abs(col_delta)
+    else: 
+        t_max_col = math.inf 
+        t_delta_col = math.inf  #math.inf means positive infinity.
+
+    # which boundary does the line reach first
+    while ( 
+        current_row != end_cell_row 
+        or current_col != end_cell_col
+    ):
+        if t_max_row < t_max_col:
+            # The line reaches a row boundary first 
+            current_row += row_step 
+            cells.append((current_row, current_col))
+            t_max_row += t_delta_row 
+        elif t_max_col < t_max_row:
+            # THe line reaches a column boundary first 
+            current_col += col_step 
+            cells.append((current_row, current_col))
+            t_max_col += t_delta_col 
+        else: #The line hits both at the same time 
+            # include every box that it touches 
+            next_row = current_row + row_step 
+            next_col = current_col + col_step 
+
+            cells.append((next_row, current_col))
+            cells.append((current_row, next_col))
+
+            current_row = next_row 
+            current_col = next_col 
+            cells.append((current_row, current_col))
+
+            t_max_row += t_delta_row
+            t_max_col += t_delta_col
+    return cells 
+
+""" ===== END OF RDP AND minimum SNAP ====== """
 # North/East waypoints in meters; center as (0, 0).
 def smooth_path_NorthEast(smooth_path):
     waypoints = []
@@ -196,8 +538,8 @@ def smooth_path_NorthEast(smooth_path):
         north_m = GRID_CENTER - row
         east_m = col - GRID_CENTER
         waypoints.append((
-            round(north_m, 2),
-            round(east_m, 2),
+            float(round(north_m, 2)),
+            float(round(east_m, 2)),
         ))
     return waypoints
 
@@ -247,7 +589,7 @@ def draw(win, grid, smooth_paths=None):
     pygame.display.update()
 
 # Saves the cells to the JSON map file.
-def save_map(grid, start, waypoints):
+def save_map(grid, start, waypoints, mission_waypoints_ne=None):
     barriers = []
     for row in grid:
         for spot in row:
@@ -259,6 +601,12 @@ def save_map(grid, start, waypoints):
         "waypoints": [waypoint.get_pos() for waypoint in waypoints],
         "barriers": barriers
     }
+
+    if mission_waypoints_ne is not None:
+        data["mission_waypoints_ne"] = [
+            [float(north), float(east)]
+            for north, east in mission_waypoints_ne
+        ]
 
     with open(MAP_FILE, "w") as file:
         json.dump(data, file)
@@ -315,7 +663,13 @@ def get_clicked_pos(pos, rows, width):
 def h(p1, p2):
     row1, col1 = p1 
     row2, col2 = p2 
-    return abs(row1 - row2) + abs(col1 - col2)
+    dr = abs(row1 - row2)
+    dc = abs(col1 - col2)
+
+    diagonal_steps = min(dr, dc) 
+    straight_steps = max(dr, dc) - diagonal_steps 
+
+    return straight_steps + math.sqrt(2) * diagonal_steps
 
 # Traces the route from goal back to start
 def reconstruct_path(came_from , current, draw_callback):
@@ -356,8 +710,9 @@ def algorithm(draw_callback, grid, start, end):
             path = reconstruct_path(came_from, current, draw_callback)
             return path
 
-        for neighbor in current.neighbors:
-            tentative_g_score = g_score[current] + 1
+        for neighbor, movement_cost in current.neighbors:
+            tentative_g_score = g_score[current] + movement_cost
+            
             if tentative_g_score < g_score[neighbor]:
                 came_from[neighbor] = current
                 g_score[neighbor] = tentative_g_score
@@ -480,42 +835,104 @@ def make_smoothed_path(simplified_path, grid):
 
 # does the WP in order, 
 def plan_mission(draw_callback, grid, start, waypoints):
-    current_start = start
-    mission_wp_ne = []
-    mission_smooth_paths = []
 
-    for waypoints_number, goal in enumerate(waypoints, start=1):
+    mission_wp_ne = []
+    display_paths = []
+    all_rdp_clear = True
+    all_minimum_snap_clear = True
+    mission_complete = True
+
+    current_start = start
+
+    for waypoint_number, goal in enumerate(waypoints, start=1):
         if not is_inside_geofence(goal):
-            print(f"Waypoint {waypoints_number} is outside the geofence. Skipped")
-            continue 
+            print(f"Waypoint {waypoint_number} is outside the geofence. Skipped.")
+            mission_complete = False
+            continue
 
         path = algorithm(draw_callback, grid, current_start, goal)
 
         if not path:
-            print(f"Waypoint {waypoints_number} cannot be reached. Mission stopped.")
+            print(f"Waypoint {waypoint_number} cannot be reached. Mission stopped.")
+            mission_complete = False
             break
 
-        simplified_path = simplify_path(path)
+        path_points = [(spot.row, spot.col) for spot in path]
+        rdp_points = rdp(path_points, RDP_EPSILON)
 
-        smooth_path = make_smoothed_path(simplified_path, grid)
-        mission_smooth_paths.append(smooth_path)
-        segment_ne = smooth_path_NorthEast(smooth_path)
+        rdp_is_clear = all(
+            is_safe_continuous_segment(a, b, grid)
+            for a, b in zip(rdp_points, rdp_points[1:])
+        )
+
+        if rdp_is_clear:
+            route_grid = rdp_points
+            mission_route_grid = rdp_points
+            try:
+                coefficients, durations = solve_minimum_snap(route_grid)
+                minimum_snap_path = sample_minimum_snap(coefficients, durations)
+                minimum_snap_is_safe, unsafe_point = is_safe_minimum_snap_path(
+                    minimum_snap_path, grid
+                )
+            except RuntimeError as error:
+                minimum_snap_is_safe = False
+                unsafe_point = None
+                print(f"Leg {waypoint_number}: minimum-snap solver failed: {error}")
+
+            if minimum_snap_is_safe:
+                route_grid = minimum_snap_path
+                print(
+                    f"Leg {waypoint_number}: using safe 7th-degree minimum-snap "
+                    f"trajectory ({len(route_grid)} samples)."
+                )
+            else:
+                # An unconstrained polynomial may round an obstacle even though
+                # every straight RDP segment is clear.  The RDP route remains
+                # the trusted, collision-free fallback.
+                all_minimum_snap_clear = False
+                if unsafe_point is not None:
+                    print(
+                        f"Leg {waypoint_number}: minimum-snap leaves the safe "
+                        f"corridor near row={unsafe_point[0]:.2f}, "
+                        f"col={unsafe_point[1]:.2f}; using RDP fallback."
+                    )
+                else:
+                    print(
+                        f"Leg {waypoint_number}: minimum-snap unavailable; "
+                        "using RDP fallback."
+                    )
+        else:
+            # Keep the already-safe A* route, with Bézier turns only where safe.
+            simplified_path = simplify_path(path)
+            route_grid = make_smoothed_path(simplified_path, grid)
+            mission_route_grid = route_grid
+            all_rdp_clear = False
+            print(
+                f"Leg {waypoint_number}: RDP shortcut unsafe; "
+                "using safe A*/Bézier fallback."
+            )
+
+        display_paths.append(route_grid)
+        segment_ne = smooth_path_NorthEast(mission_route_grid)
 
         if mission_wp_ne:
             mission_wp_ne.extend(segment_ne[1:])
         else:
-            mission_wp_ne.extend(segment_ne) 
+            mission_wp_ne.extend(segment_ne)
 
-        print(f"Waypoint {waypoints_number} route: ")
-        print(segment_ne) 
-
-        current_start = goal 
+        current_start = goal
 
     start.make_start()
     for index, waypoint in enumerate(waypoints):
         waypoint.make_waypoint(index)
 
-    return mission_wp_ne, mission_smooth_paths
+    return (
+        mission_wp_ne,
+        display_paths,
+        all_rdp_clear,
+        all_minimum_snap_clear,
+        mission_complete,
+    )
 
 def main(win, width):
     grid = make_grid(ROWS, CELL_PIXELS)
@@ -536,8 +953,8 @@ def main(win, width):
                 pos = pygame.mouse.get_pos()
                 row, col = get_clicked_pos(pos, ROWS, width)
 
-                if not is_geofence_boundary(row, col):
-                    spot = grid[row][col]
+                spot = grid[row][col]
+                if is_inside_geofence(spot):
                     if not start:
                         start = spot
                         start.make_start()
@@ -556,8 +973,8 @@ def main(win, width):
                 pos = pygame.mouse.get_pos()
                 row, col = get_clicked_pos(pos, ROWS, width)
 
-                if not is_geofence_boundary(row, col):
-                    spot = grid[row][col]
+                spot = grid[row][col]
+                if is_inside_geofence(spot):
 
                     if spot == start:
                         spot.reset()
@@ -593,15 +1010,38 @@ def main(win, width):
                     for row in grid:
                         for spot in row:
                             spot.update_neighbors(grid)
-                    mission_wp_ne, smooth_paths = plan_mission(
+
+                    (
+                        mission_wp_ne,
+                        smooth_paths,
+                        all_rdp_clear,
+                        all_minimum_snap_clear,
+                        mission_complete,
+                    ) = plan_mission(
                         lambda: draw(win, grid),
                         grid,
                         start,
                         waypoints
                     )
 
-                    print("Full mission NE waypoints (m)")
-                    print(mission_wp_ne)
+                    if all_rdp_clear:
+                        print("All mission legs use safe RDP shortcuts.")
+                    else:
+                        print("One or more RDP shortcuts were unsafe; safe fallback used.")
+
+                    if not all_minimum_snap_clear:
+                        print("One or more minimum-snap legs were unsafe; RDP fallback used.")
+
+                    print(f"Mission waypoints: {len(mission_wp_ne)} anchors")
+                    print(f"Start: {mission_wp_ne[0]}")
+                    print(f"End:   {mission_wp_ne[-1]}")
+
+                    if mission_complete:
+                        save_map(grid, start, waypoints, mission_wp_ne)
+                        print("Generated mission route saved for flight.")
+                    else:
+                        print("Generated route was incomplete; flight route was not saved.")
+
     pygame.quit()
 
 main(WIN, WINDOW_SIZE)
